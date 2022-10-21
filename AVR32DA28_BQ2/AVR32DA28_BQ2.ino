@@ -118,7 +118,7 @@ uint32_t AccumulatedCharge_Frac;// in BQ769x2_READPASSQ func
 uint32_t AccumulatedCharge_Time;// in BQ769x2_READPASSQ func
 /* USER CODE END PV */
 
-
+int count = 0;
 
 
 
@@ -173,10 +173,22 @@ void setup() {
   // 'REG12 Config' - Enable REG1 with 5V output (0x0D for 3.3V, 0x0F=0b00001111 for 5V)
   //BQ769x2_SetRegister(REG12Config, 0b00001111, 1); // REG1 change to 5V and enable 0000 1111
 
+  // Set TS1 to measure Cell Temperature - 0x92FD = 0x07
+  // Temporarily disable - 0x92FD = 0x00
+  BQ769x2_SetRegister(TS1Config, 0x00, 1);
+
+  // Set up Cell Balancing Configuration - 0x9335 = 0x03   -  Automated balancing while in Relax or Charge modes
+  // Also see "Cell Balancing with BQ769x2 Battery Monitors" document on ti.com
+  BQ769x2_SetRegister(BalancingConfiguration, 0x03, 1);
+  
   // Set up ALERT Pin - 0x92FC = 0x2A
   // This configures the ALERT pin to drive high (REG1 voltage) when enabled.
   // The ALERT pin can be used as an interrupt to the MCU when a protection has triggered or new measurements are available
   BQ769x2_SetRegister(ALERTPinConfig, 0x2A, 1);
+
+  // 5th bit: 1 = Default host FET control state forces FETs off
+  //BQ769x2_SetRegister(FETOptions, 0b00011101, 1);
+  
   
   // 'VCell Mode' - Enable 6 cells 0000000010 10101011
   BQ769x2_SetRegister(VCellMode, 0b000000001010101011, 2);
@@ -196,19 +208,66 @@ void loop() {
   BQ769x2_ReadAllVoltages();
   Temperature[0] = BQ769x2_ReadTemperature(TS1Temperature);
   Serial.print("Stack Voltage: ");
-  Serial.println(Stack_Voltage);
+  Serial.print(Stack_Voltage);
+  Serial.println("mV");
   Serial.print("Pack Voltage: ");
-  Serial.println(Pack_Voltage);
+  Serial.print(Pack_Voltage);
+  Serial.println("mV");
   Serial.print("LD Voltage: ");
-  Serial.println(LD_Voltage);
-  for(int i = 0; i < 15; i++){
-    Serial.print("Cell ");
-    Serial.print(i+1);
-    Serial.print(" Voltage: ");
-    Serial.println(CellVoltage[i]);
-  }
-  Serial.print("TS1 Temperature: ");
-  Serial.println(Temperature[0]);
+  Serial.print(LD_Voltage);
+  Serial.println("mV");
+
+
+  // Print Cell Voltages 
+  Serial.print("Cell ");
+  Serial.print(1);
+  Serial.print(" Voltage: ");
+  Serial.print(CellVoltage[0]);
+  Serial.println("mV");
+    
+  Serial.print("Cell ");
+  Serial.print(2);
+  Serial.print(" Voltage: ");
+  Serial.print(CellVoltage[1]);
+  Serial.println("mV");
+  
+  Serial.print("Cell ");
+  Serial.print(3);
+  Serial.print(" Voltage: ");
+  Serial.print(CellVoltage[3]);
+  Serial.println("mV");
+  
+  Serial.print("Cell ");
+  Serial.print(4);
+  Serial.print(" Voltage: ");
+  Serial.print(CellVoltage[5]);
+  Serial.println("mV");
+  
+  Serial.print("Cell ");
+  Serial.print(5);
+  Serial.print(" Voltage: ");
+  Serial.print(CellVoltage[7]);
+  Serial.println("mV");
+  
+  Serial.print("Cell ");
+  Serial.print(6);
+  Serial.print(" Voltage: ");
+  Serial.print(CellVoltage[9]);
+  Serial.println("mV");
+  
+//  for(int i = 0; i < 15; i++){
+//    Serial.print("Cell ");
+//    Serial.print(i+1);
+//    Serial.print(" Voltage: ");
+//    Serial.print(CellVoltage[i]);
+//    Serial.println("mV");
+//  }
+
+
+//  Serial.print("TS1 Temperature: ");
+//  Serial.print(Temperature[0]);
+//  Serial.println("C");
+
   VoltageTest = BQ769x2_ReadVoltage(Cell1Voltage); // Cell voltage given in mV
   Serial.print("Cell 1 Voltage: ");
   Serial.print(VoltageTest);
@@ -218,9 +277,27 @@ void loop() {
   Serial.print(InternalTemp);
   Serial.println("C");
   
+  if(count%10==0 && count%20!=0){
+    BQ769x2_BOTHOFF ();
+  }
+  if(count%20==0){
+    BQ769x2_RESET_BOTHOFF ();
+  }
+  BQ769x2_ReadFETStatus();
+  Serial.print("DSG: ");
+  Serial.println(DSG);
+  Serial.print("CHG: ");
+  Serial.println(CHG);
+  Serial.print("PCHG: ");
+  Serial.println(PCHG);
+  Serial.print("PDSG: ");
+  Serial.println(PDSG);
+  
+  
   SPI.endTransaction();
   blinkLED(LED4,500,1);
   delay(200);  
+  count++;
   /*
   SPI.swap(PI_SPI);
   SPI.begin();
@@ -573,4 +650,31 @@ float BQ769x2_ReadTemperature(uint8_t command)
   DirectCommands(command, 0x00, R);
   //RX_data is a global var
   return (0.1 * (float)(RX_data[1]*256 + RX_data[0])) - 273.15;  // converts from 0.1K to Celcius
+}
+
+
+//  ********************************* FET Control Commands  ***************************************
+
+void BQ769x2_BOTHOFF () {
+  // Disables all FETs using the DFETOFF (BOTHOFF) pin
+  // The DFETOFF pin on the BQ76952EVM should be connected to the MCU board to use this function
+  digitalWrite(DFETOFF, HIGH);
+  //HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);  // DFETOFF pin (BOTHOFF) set high
+}
+
+void BQ769x2_RESET_BOTHOFF () {
+  // Resets DFETOFF (BOTHOFF) pin
+  // The DFETOFF pin on the BQ76952EVM should be connected to the MCU board to use this function
+  digitalWrite(DFETOFF, LOW);
+  //HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);  // DFETOFF pin (BOTHOFF) set low
+}
+
+void BQ769x2_ReadFETStatus() { 
+  // Read FET Status to see which FETs are enabled
+  DirectCommands(FETStatus, 0x00, R);
+  FET_Status = (RX_data[1]*256 + RX_data[0]);
+  DSG = ((0x4 & RX_data[0])>>2);// discharge FET state
+  CHG = (0x1 & RX_data[0]);// charge FET state
+  PCHG = ((0x2 & RX_data[0])>>1);// pre-charge FET state
+  PDSG = ((0x8 & RX_data[0])>>3);// pre-discharge FET state
 }
