@@ -1,5 +1,12 @@
 #include <SPI.h>
+#include <stdio.h>
+#include "BQ769x2Header.h"
+#include <math.h>                           /* math functions */
+#include "linreg.h"
+#include <stdlib.h>
 
+//#define REAL float
+#define REAL double
 
 // Primary board comms pins
 #define MOSI0 2
@@ -16,10 +23,6 @@
 // To use in SPI.swap() function to swap between communicating to BQ and to primary board
 #define PI_SPI SPI0_SWAP_DEFAULT
 #define BQ_SPI SPI1_SWAP_DEFAULT
-
-// To use before and after communication
-#define SPIBeginTrans  SPI.beginTransaction(SPISettings(24000000, MSBFIRST, SPI_MODE0));
-#define SPIEndTrans    SPI.endTransaction();
 
 // LED pins
 #define LED1  19
@@ -38,44 +41,14 @@
 // -- Ground (2) 
 // -- Shorted/Grounded (9)
 
-
-
-
-
-
-/* Includes ------------------------------------------------------------------*/
-
-
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
-#include <stdio.h>
-#include "BQ769x2Header.h"
-/* USER CODE END Includes */
-
-/* Private typedef -----------------------------------------------------------*/
-/* USER CODE BEGIN PTD */
-
-/* USER CODE END PTD */
-
-/* Private define ------------------------------------------------------------*/
-/* USER CODE BEGIN PD */
+#define GRADIENTLIMIT 5 // heuristically determined gradient limit based on testing
 #define DEV_ADDR  0x10  // BQ769x2 address is 0x10 including R/W bit or 0x8 as 7-bit address
 #define CRC_Mode 0  // 0 for disabled, 1 for enabled
 #define MAX_BUFFER_SIZE 10
 #define R 0 // Read; Used in DirectCommands and Subcommands functions
 #define W 1 // Write; Used in DirectCommands and Subcommands functions
 #define W2 2 // Write data with two bytes; Used in Subcommands function
-/* USER CODE END PD */
 
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
-
-/* USER CODE END PM */
-
-/* Private variables ---------------------------------------------------------*/
-
-
-/* USER CODE BEGIN PV */
 uint8_t CRC_check_send;
 uint8_t CRC_check;
 uint8_t rxdata [2];
@@ -116,29 +89,15 @@ uint8_t PDSG = 0;  // pre-discharge FET state
 uint32_t AccumulatedCharge_Int; // in BQ769x2_READPASSQ func
 uint32_t AccumulatedCharge_Frac;// in BQ769x2_READPASSQ func
 uint32_t AccumulatedCharge_Time;// in BQ769x2_READPASSQ func
-/* USER CODE END PV */
-
-int count = 0;
-
-
-
-
-
-
-
 
 
 
 
 void setup() {
-  // put your setup code here, to run once:
   Serial.pins(4,5); // tx rx -> MISO0 MOSI0 of board, pins 4 and 5
   Serial.begin(115200);
   SPI.swap(BQ_SPI);
   SPI.begin();
-  //SPI.setBitOrder(LSBFIRST);
-  //SPI.setClockDivider(SPI_CLOCK_DIV2);
-  //SPI.setDataMode(SPI_MODE0);
   
   // LED output pins
   pinMode(LED1, OUTPUT);
@@ -149,8 +108,6 @@ void setup() {
   // Primary board comms SPI pins
   pinMode(MOSI0, OUTPUT);
   pinMode(MISO0, INPUT);
-  pinMode(SCLK0, OUTPUT);
-  pinMode(CS0, OUTPUT);
 
   // BQ SPI pins
   pinMode(MOSI1, OUTPUT);
@@ -158,9 +115,9 @@ void setup() {
   pinMode(SCLK1, OUTPUT);
   pinMode(CS1, OUTPUT);
 
-  // Chip Select (CS) should always be active (low)
-  digitalWrite(CS0, LOW);
-  digitalWrite(CS1, LOW);
+  // Chip Select (CS) be high until talking to BQ
+  digitalWrite(CS0, HIGH);
+  digitalWrite(CS1, HIGH);
   delay(2000);
   blinkLED(LED1, 50, 30);
 
@@ -168,14 +125,13 @@ void setup() {
   //BQ769x2_SetRegister(SPIConfiguration, 0b01100000, 1); // set MISO to use REG1
 
   // 'REG0 Config' - set REG0_EN bit to enable pre-regulator
-  //BQ769x2_SetRegister(REG0Config, 0x01, 1);
+  BQ769x2_SetRegister(REG0Config, 0x01, 1);
   
   // 'REG12 Config' - Enable REG1 with 5V output (0x0D for 3.3V, 0x0F=0b00001111 for 5V)
-  //BQ769x2_SetRegister(REG12Config, 0b00001111, 1); // REG1 change to 5V and enable 0000 1111
+  BQ769x2_SetRegister(REG12Config, 0b00001111, 1); // REG1 change to 5V and enable 0000 1111
 
   // Set TS1 to measure Cell Temperature - 0x92FD = 0x07
-  // Temporarily disable - 0x92FD = 0x00
-  BQ769x2_SetRegister(TS1Config, 0x00, 1);
+  BQ769x2_SetRegister(TS1Config, 0x07, 1);
 
   // Set up Cell Balancing Configuration - 0x9335 = 0x03   -  Automated balancing while in Relax or Charge modes
   // Also see "Cell Balancing with BQ769x2 Battery Monitors" document on ti.com
@@ -184,11 +140,7 @@ void setup() {
   // Set up ALERT Pin - 0x92FC = 0x2A
   // This configures the ALERT pin to drive high (REG1 voltage) when enabled.
   // The ALERT pin can be used as an interrupt to the MCU when a protection has triggered or new measurements are available
-  BQ769x2_SetRegister(ALERTPinConfig, 0x2A, 1);
-
-  // 5th bit: 1 = Default host FET control state forces FETs off
-  //BQ769x2_SetRegister(FETOptions, 0b00011101, 1);
-  
+  BQ769x2_SetRegister(ALERTPinConfig, 0x2A, 1);  
   
   // 'VCell Mode' - Enable 6 cells 0000000010 10101011
   BQ769x2_SetRegister(VCellMode, 0b000000001010101011, 2);
@@ -196,17 +148,58 @@ void setup() {
 }
 
 
+
+float T1TempHistory [5] = {0,0,0,0,0};
+float T2TempHistory [5] = {0,0,0,0,0};
+float T3TempHistory [5] = {0,0,0,0,0};
+float x[5] = {0,1,2,3,4}
+
 void loop() {
-  // put your main code here, to run repeatedly:
-  uint16_t VoltageTest = 9999;
-  float InternalTemp = 9999;
   
-  //SPI.pins(MOSI0, MISO0, SCLK0, CS0);
+  if(Serial.available()>0){ // check for request from primary board
+    if(Serial.read()!=ID_NUM){  // check for 
+      flushReceive();
+    }
+    else{
+      SPI.beginTransaction(SPISettings(400000, MSBFIRST, SPI_MODE0));
+      BQ769x2_ReadAllVoltages();  // Read Stack, Pack, LD, and all Cell voltages
+      InternalTemp = BQ769x2_ReadTemperature(IntTemperature); // Internal Temp in Celsius
+      Temperature[0] = BQ769x2_ReadTemperature(TS1Temperature); // Read thermistor 1 temperature
+      Temperature[1] = BQ769x2_ReadTemperature(TS2Temperature); // Read thermistor 2 temperature
+      Temperature[2] = BQ769x2_ReadTemperature(TS3Temperature); // Read thermistor 3 temperature
+
+      T1TempHistory.dequeue(); // remove last item from thermistor 1 history
+      T2TempHistory.dequeue(); 
+      T3TempHistory.dequeue(); 
+
+      T1TempHistory.queue(Temperature[0]); // add new temp reading to queue
+      T2TempHistory.queue(Temperature[1]);
+      T3TempHistory.queue(Temperature[2]);
+
+      REAL m1,m2,m3; // least squares slopes
+      linreg(5,x,T1TempHistory,&m1,NULL,NULL); // calculates least-squares regression for T1 (only slope needed)
+      linreg(5,x,T2TempHistory,&m2,NULL,NULL); // same for T2
+      linreg(5,x,T3TempHistory,&m3,NULL,NULL); // same for T3
+      
+      if(m1 > GRADIENTLIMIT || m2 > GRADIENTLIMIT || m3 > GRADIENTLIMIT){ // check if any thermistors are increasing in gradient too quickly
+        BQ769x2_BOTHOFF (); // turn all fets off
+      }
+      
+      SPI.endTransaction();
+    }
+  }
+}
+
+
+// Alternate loop which prints voltages, temperatures, and FET states for testing and debugging
+void debuggingLoop(){
   SPI.beginTransaction(SPISettings(400000, MSBFIRST, SPI_MODE0));
   
   blinkLED(LED4, 100, 5); // Blink 5x in 1 second to signal start of BQ SPI comm
   BQ769x2_ReadAllVoltages();
   Temperature[0] = BQ769x2_ReadTemperature(TS1Temperature);
+  
+  // Print Stack, Pack and LD Voltages
   Serial.print("Stack Voltage: ");
   Serial.print(Stack_Voltage);
   Serial.println("mV");
@@ -216,7 +209,6 @@ void loop() {
   Serial.print("LD Voltage: ");
   Serial.print(LD_Voltage);
   Serial.println("mV");
-
 
   // Print Cell Voltages 
   Serial.print("Cell ");
@@ -255,34 +247,17 @@ void loop() {
   Serial.print(CellVoltage[9]);
   Serial.println("mV");
   
-//  for(int i = 0; i < 15; i++){
-//    Serial.print("Cell ");
-//    Serial.print(i+1);
-//    Serial.print(" Voltage: ");
-//    Serial.print(CellVoltage[i]);
-//    Serial.println("mV");
-//  }
 
-
-//  Serial.print("TS1 Temperature: ");
-//  Serial.print(Temperature[0]);
-//  Serial.println("C");
-
-  VoltageTest = BQ769x2_ReadVoltage(Cell1Voltage); // Cell voltage given in mV
-  Serial.print("Cell 1 Voltage: ");
-  Serial.print(VoltageTest);
-  Serial.println("mV");
+  // Print Thermistor temperature
+  Serial.print("TS1 Temperature: ");
+  Serial.print(Temperature[0]);
+  Serial.println("C");
+  
   InternalTemp = BQ769x2_ReadTemperature(IntTemperature); // Internal Temp in Celsius
   Serial.print("InternalTemp: ");
   Serial.print(InternalTemp);
   Serial.println("C");
   
-  if(count%10==0 && count%20!=0){
-    BQ769x2_BOTHOFF ();
-  }
-  if(count%20==0){
-    BQ769x2_RESET_BOTHOFF ();
-  }
   BQ769x2_ReadFETStatus();
   Serial.print("DSG: ");
   Serial.println(DSG);
@@ -296,16 +271,6 @@ void loop() {
   
   SPI.endTransaction();
   blinkLED(LED4,500,1);
-  delay(200);  
-  count++;
-  /*
-  SPI.swap(PI_SPI);
-  SPI.begin();
-  digitalWrite(LED2, HIGH);
-  SPI.end();
-  delay(2000);
-  */
-
 }
 
 
@@ -319,7 +284,61 @@ void blinkLED(int led, int timems, int blinknumber)
     }
 }
 
+// flushes Serial receive (RX) register values
+void flushReceive(){
+  while(Serial.available()){
+    Serial.read();
+  }
+}
 
+
+// code for calculating least squares regression, from https://stackoverflow.com/a/19040841
+/*
+n = number of data points
+x,y  = arrays of data
+*b = output intercept
+*m  = output slope
+*r = output correlation coefficient
+*/
+
+inline static REAL sqr(REAL x) {
+    return x*x;
+}
+
+int linreg(int n, const REAL x[], const REAL y[], REAL* m, REAL* b, REAL* r){
+    REAL   sumx = 0.0;                      /* sum of x     */
+    REAL   sumx2 = 0.0;                     /* sum of x**2  */
+    REAL   sumxy = 0.0;                     /* sum of x * y */
+    REAL   sumy = 0.0;                      /* sum of y     */
+    REAL   sumy2 = 0.0;                     /* sum of y**2  */
+
+    for (int i=0;i<n;i++){ 
+        sumx  += x[i];       
+        sumx2 += sqr(x[i]);  
+        sumxy += x[i] * y[i];
+        sumy  += y[i];      
+        sumy2 += sqr(y[i]); 
+    } 
+
+    REAL denom = (n * sumx2 - sqr(sumx));
+    if (denom == 0) {
+        // singular matrix. can't solve the problem.
+        *m = 0;
+        *b = 0;
+        if (r) *r = 0;
+            return 1;
+    }
+
+    *m = (n * sumxy  -  sumx * sumy) / denom;
+    *b = (sumy * sumx2  -  sumx * sumxy) / denom;
+    if (r!=NULL) {
+        *r = (sumxy - sumx * sumy / n) /    /* compute correlation coeff */
+              sqrt((sumx2 - sqr(sumx)/n) *
+              (sumy2 - sqr(sumy)/n));
+    }
+
+    return 0; 
+}
 
 
 
@@ -457,12 +476,6 @@ void SPI_ReadReg(uint8_t reg_addr, uint8_t *reg_data, uint8_t count) {
     TX_Buffer[0] = addr;
     TX_Buffer[1] = 0xFF;
     CRC_check_send = CRC8(TX_Buffer,2);
-//    Serial.print("TX_Buffer[0]: ");
-//    Serial.println(TX_Buffer[0], HEX);
-//    Serial.print("TX_Buffer[1]: ");
-//    Serial.println(TX_Buffer[1], HEX);
-//    Serial.print("TX_Buffer[2]: ");
-//    Serial.println(TX_Buffer[2], HEX);
     
     digitalWrite(CS1, LOW);
     rxdata[0] = SPI.transfer(TX_Buffer[0]);
@@ -471,9 +484,6 @@ void SPI_ReadReg(uint8_t reg_addr, uint8_t *reg_data, uint8_t count) {
     delayMicroseconds(2);
     CRC_check = SPI.transfer(CRC_check_send);
     digitalWrite(CS1, HIGH);
-    //HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
-    //HAL_SPI_TransmitReceive(&hspi1, TX_Buffer, rxdata, 2, 1);
-    //HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET); 
         
     while ((match == 0) & (retries > 0)) {
       delayMicroseconds(500);
@@ -485,9 +495,6 @@ void SPI_ReadReg(uint8_t reg_addr, uint8_t *reg_data, uint8_t count) {
       delayMicroseconds(2);
       CRC_check = SPI.transfer(CRC_check_send);
       digitalWrite(CS1, HIGH);
-//      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
-//      HAL_SPI_TransmitReceive(&hspi1, TX_Buffer, rxdata, 2, 1);
-//      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET); 
       
       // Check for matching command (Slave sent command back meaning)
       // Also check for CRC8
@@ -498,20 +505,6 @@ void SPI_ReadReg(uint8_t reg_addr, uint8_t *reg_data, uint8_t count) {
       }
       retries --;
     } 
-//    Serial.print("rxdata[0]: ");
-//    Serial.println(rxdata[0], HEX);
-//    Serial.print("rxdata[1]: ");
-//    Serial.println(rxdata[1], HEX);
-//    Serial.print("CRC_check: ");
-//    Serial.println(CRC_check, HEX);
-//    
-//    Serial.print("TX_Buffer[0]: ");
-//    Serial.println(TX_Buffer[0], HEX);
-//    Serial.print("TX_Buffer[1]: ");
-//    Serial.println(TX_Buffer[1], HEX);
-//    Serial.print("TX_Buffer[2]: ");
-//    Serial.println(TX_Buffer[2], HEX);
-//    Serial.println("---------------");
     match = 0;
     addr += 1;
     delayMicroseconds(500);
@@ -659,14 +652,12 @@ void BQ769x2_BOTHOFF () {
   // Disables all FETs using the DFETOFF (BOTHOFF) pin
   // The DFETOFF pin on the BQ76952EVM should be connected to the MCU board to use this function
   digitalWrite(DFETOFF, HIGH);
-  //HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);  // DFETOFF pin (BOTHOFF) set high
 }
 
 void BQ769x2_RESET_BOTHOFF () {
   // Resets DFETOFF (BOTHOFF) pin
   // The DFETOFF pin on the BQ76952EVM should be connected to the MCU board to use this function
   digitalWrite(DFETOFF, LOW);
-  //HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);  // DFETOFF pin (BOTHOFF) set low
 }
 
 void BQ769x2_ReadFETStatus() { 
